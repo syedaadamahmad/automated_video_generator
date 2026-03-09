@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+# Ignore virtual environment directories
+.venv/
+generated_videos/
+# Ignore log files
+*.log
+outputs/
+*.temp/
+temp_processing/
+test_prompt_decomposer.py
+test_veo_pipeline.py
