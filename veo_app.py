@@ -15,6 +15,7 @@ Install:
 import io
 import time
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import requests
@@ -298,16 +299,180 @@ html, body, [data-testid="stApp"] {
     color: var(--text) !important;
     border-radius: 6px !important;
 }
+
+/* ── Video grid ──────────────────────────────────────────────────────────── */
+.vid-grid-header {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 2rem 0 1rem;
+}
+.vid-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 1rem;
+    transition: border-color 0.2s;
+}
+.vid-card:hover { border-color: rgba(0,212,255,0.4); }
+
+/* Aspect-ratio container — height is determined by the CSS aspect-ratio    */
+/* property set inline per card. Width fills the column.                    */
+.vid-ar-box {
+    width: 100%;
+    position: relative;
+    background: var(--border);
+    overflow: hidden;
+}
+.vid-ar-box video {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    cursor: pointer;
+}
+
+/* Shimmer skeleton for loading state */
+.vid-skeleton {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        90deg,
+        var(--surface) 0%,
+        #1a2840 40%,
+        #1f3356 50%,
+        #1a2840 60%,
+        var(--surface) 100%
+    );
+    background-size: 250% 100%;
+    animation: shimmer 1.8s ease-in-out infinite;
+}
+@keyframes shimmer {
+    0%   { background-position:  200% 0; }
+    100% { background-position: -200% 0; }
+}
+.vid-skeleton-icon {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2rem;
+    opacity: 0.2;
+}
+
+/* Card footer */
+.vid-footer {
+    padding: 0.6rem 0.75rem 0.4rem;
+}
+.vid-prompt-text {
+    font-size: 0.75rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 0.35rem;
+}
+.vid-meta {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.62rem;
+    color: var(--muted);
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.vid-status-ok   { color: var(--success); }
+.vid-status-fail { color: var(--error); }
+.vid-status-proc { color: var(--warn); }
+.vid-ar-tag {
+    background: #1a2840;
+    color: var(--accent);
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+    font-size: 0.58rem;
+}
+
+/* Rerun button — sits below each video card via st.button */
+[data-testid="stButton"] button[kind="secondary"] {
+    background: transparent !important;
+    border: 1px solid var(--border) !important;
+    color: var(--muted) !important;
+    font-family: 'Space Mono', monospace !important;
+    font-size: 0.65rem !important;
+    padding: 0.25rem 0.6rem !important;
+    width: 100% !important;
+    transition: border-color 0.15s, color 0.15s !important;
+}
+[data-testid="stButton"] button[kind="secondary"]:hover {
+    border-color: var(--warn) !important;
+    color: var(--warn) !important;
+}
+
+/* ── YouTube queue ───────────────────────────────────────────────────────── */
+.yt-queue-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+}
+.yt-queue-card.uploaded {
+    border-color: var(--success);
+}
+.yt-queue-card.failed {
+    border-color: var(--error);
+}
+.yt-queue-card.uploading {
+    border-color: var(--warn);
+}
+.yt-video-thumb {
+    width: 100%;
+    aspect-ratio: 16/9;
+    object-fit: cover;
+    border-radius: 6px;
+    background: var(--border);
+}
+.yt-link {
+    color: #ff0000;
+    font-family: Space Mono, monospace;
+    font-size: 0.75rem;
+    text-decoration: none;
+    font-weight: 700;
+}
+.yt-link:hover { text-decoration: underline; }
+.approve-badge {
+    display: inline-block;
+    background: rgba(16,185,129,0.15);
+    color: var(--success);
+    border: 1px solid var(--success);
+    border-radius: 20px;
+    font-family: Space Mono, monospace;
+    font-size: 0.62rem;
+    padding: 0.2rem 0.6rem;
+    letter-spacing: 0.06em;
+}
 </style>
 """, unsafe_allow_html=True)
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
 for key, default in [
-    ("jobs",         {}),
-    ("active_job",   None),
-    ("upload_error", None),
-    ("api_ok",       None),
+    ("jobs",           {}),
+    ("active_job",     None),
+    ("upload_error",   None),
+    ("api_ok",         None),
+    ("rerun_pending",  set()),   # set of (job_id, prompt_index) currently rerunning
+    ("is_generating",     False),   # True while a job is running — blocks duplicate submits
+    ("last_completed_job", None),   # job_id of most recently completed job — keeps grid visible
+    ("approved_set",   set()),   # set of (job_id, prompt_index) approved for YouTube
+    ("yt_queue",       []),      # cached YouTube queue from last fetch
+
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -348,6 +513,115 @@ def fetch_all_jobs() -> list:
         return []
 
 
+def approve_video(job_id: str, prompt_index: int) -> Optional[dict]:
+    """POST /api/jobs/{job_id}/approve/{prompt_index} — add to YouTube queue."""
+    try:
+        r = requests.post(
+            f"{API_BASE}/api/jobs/{job_id}/approve/{prompt_index}",
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def fetch_youtube_queue() -> list:
+    try:
+        r = requests.get(f"{API_BASE}/api/youtube/queue", timeout=5)
+        r.raise_for_status()
+        return r.json().get("queue", [])
+    except Exception:
+        return []
+
+
+def update_queue_item(queue_id: str, title: str, description: str, tags: list) -> bool:
+    try:
+        r = requests.patch(
+            f"{API_BASE}/api/youtube/queue/{queue_id}",
+            json={"title": title, "description": description, "tags": tags},
+            timeout=10,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def trigger_youtube_upload() -> dict:
+    try:
+        r = requests.post(f"{API_BASE}/api/youtube/upload", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def remove_from_queue(queue_id: str) -> bool:
+    try:
+        r = requests.delete(f"{API_BASE}/api/youtube/queue/{queue_id}", timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def fetch_youtube_status() -> dict:
+    try:
+        r = requests.get(f"{API_BASE}/api/youtube/status", timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {"configured": False, "authenticated": False}
+
+
+def rerun_prompt(job_id: str, prompt_index: int) -> bool:
+    """POST /api/jobs/{job_id}/rerun/{prompt_index}. Returns True on success."""
+    try:
+        r = requests.post(
+            f"{API_BASE}/api/jobs/{job_id}/rerun/{prompt_index}",
+            timeout=10,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _ar_to_css(ar: str) -> str:
+    """
+    Convert aspect ratio string to CSS aspect-ratio value.
+    '9:16' → '9/16', '16:9' → '16/9', etc.
+    Falls back to '1/1' for unknown values.
+    """
+    mapping = {
+        "9:16": "9/16",
+        "16:9": "16/9",
+        "1:1":  "1/1",
+        "4:3":  "4/3",
+        "3:4":  "3/4",
+    }
+    return mapping.get(str(ar).strip(), "9/16")
+
+
+def _safe_int(value, default: int = 0, lo: int = None, hi: int = None) -> int:
+    """
+    Convert any DataFrame cell value to int safely.
+    Handles NaN, None, inf, non-numeric strings.
+    Clamps to [lo, hi] when provided.
+    """
+    import math
+    try:
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        result = int(v)
+    except (TypeError, ValueError):
+        return default
+    if lo is not None:
+        result = max(lo, result)
+    if hi is not None:
+        result = min(hi, result)
+    return result
+
+
 def clip_count(duration: int) -> int:
     return -(-duration // CLIP_DURATION)   # ceil div
 
@@ -372,12 +646,13 @@ def badge_task(task_type: str) -> str:
 def render_preview_table(df: pd.DataFrame):
     rows_html = ""
     for _, row in df.iterrows():
-        dur   = int(row.get("duration", 8))
+        dur   = _safe_int(row.get("duration", 8), default=8, lo=1, hi=120)
         clips = clip_count(dur)
         tt    = str(row.get("task_type", "AUTO")).upper()
-        prio  = row.get("priority", 5)
+        prio  = _safe_int(row.get("priority", 5), default=5, lo=1, hi=10)
+        import html as _html
         prompt = str(row.get("prompt", ""))
-        prompt_display = prompt[:90] + "…" if len(prompt) > 90 else prompt
+        prompt_display = _html.escape(prompt[:90] + "…" if len(prompt) > 90 else prompt)
 
         clip_note = f'<div class="clip-note">→ {clips} clip{"s" if clips > 1 else ""}</div>' if clips > 1 else ""
 
@@ -390,7 +665,7 @@ def render_preview_table(df: pd.DataFrame):
                 {clip_note}
             </td>
             <td>{badge_task(tt)}</td>
-            <td style="font-family:Space Mono,monospace;font-size:0.75rem;color:var(--muted)">{int(prio)}</td>
+            <td style="font-family:Space Mono,monospace;font-size:0.75rem;color:var(--muted)">{prio}</td>
         </tr>"""
 
     st.markdown(f"""
@@ -400,6 +675,159 @@ def render_preview_table(df: pd.DataFrame):
         </tr></thead>
         <tbody>{rows_html}</tbody>
     </table>""", unsafe_allow_html=True)
+
+
+def render_video_grid(job: dict) -> None:
+    """
+    Render a card grid of all prompts in a job.
+
+    - One card per prompt, laid out in 3 columns.
+    - Each card shows a shimmer skeleton while the video is processing.
+    - Once completed, shows an HTML5 <video> element (click-to-play).
+    - Card height is driven by CSS aspect-ratio matching the prompt's aspect_ratio field.
+    - A '↻ Rerun' button below each completed or failed card lets the user re-generate.
+
+    Why HTML5 video not st.video:
+        st.video can't be embedded inside column layouts with custom CSS wrappers.
+        The API serves videos on /videos/... — direct URL works in <video src>.
+    """
+    import html as _html
+
+    prompts   = job.get("prompts", [])
+    results   = job.get("results", {}) if isinstance(job.get("results"), dict) else {}
+    job_id    = job.get("job_id", "")
+    job_status = job.get("status", "processing")
+
+    if not prompts:
+        return
+
+    st.markdown('<div class="vid-grid-header">🎬 Generated Videos</div>',
+                unsafe_allow_html=True)
+
+    # 3-column grid — all prompts rendered, skeletons for pending
+    cols = st.columns(3)
+
+    for i, prompt_data in enumerate(prompts):
+        col = cols[i % 3]
+        result = results.get(str(i), {})
+        status = result.get("status", "processing")
+        video_url = result.get("video_url")
+        prompt_text = prompt_data.get("prompt_text") or prompt_data.get("text", "")
+        ar_raw  = prompt_data.get("aspect_ratio", "9:16")
+        ar_css  = _ar_to_css(ar_raw)
+        clips   = result.get("clips_count", 0)
+        dur     = result.get("duration_seconds", 0)
+        err     = result.get("error_message", "")
+        is_rerunning = (job_id, i) in st.session_state.rerun_pending
+
+        with col:
+            # ── Card header (aspect-ratio box) ────────────────────────────────
+            if status in ("completed", "partial") and video_url:
+                # video_url is either a local FastAPI route (/videos/...)
+                # or a full S3 HTTPS URL — handle both
+                if video_url.startswith("http"):
+                    full_url = video_url          # S3 or external URL — use as-is
+                else:
+                    full_url = f"{API_BASE}{video_url}"  # local FastAPI route
+                safe_url  = _html.escape(full_url)
+                st.markdown(f"""
+<div class="vid-card">
+  <div class="vid-ar-box" style="aspect-ratio:{ar_css}">
+    <video controls preload="metadata">
+      <source src="{safe_url}" type="video/mp4">
+    </video>
+  </div>
+  <div class="vid-footer">
+    <div class="vid-prompt-text" title="{_html.escape(prompt_text[:200])}">{_html.escape(prompt_text[:60])}{'…' if len(prompt_text) > 60 else ''}</div>
+    <div class="vid-meta">
+      <span class="vid-status-ok">✓ done</span>
+      <span class="vid-ar-tag">{ar_raw}</span>
+      {f'<span>{clips} clips · {dur}s</span>' if clips > 1 else ''}
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+            elif status == "failed":
+                st.markdown(f"""
+<div class="vid-card">
+  <div class="vid-ar-box" style="aspect-ratio:{ar_css}">
+    <div class="vid-skeleton"></div>
+    <div class="vid-skeleton-icon">✗</div>
+  </div>
+  <div class="vid-footer">
+    <div class="vid-prompt-text">{_html.escape(prompt_text[:60])}{'…' if len(prompt_text) > 60 else ''}</div>
+    <div class="vid-meta">
+      <span class="vid-status-fail">✗ failed</span>
+      <span class="vid-ar-tag">{ar_raw}</span>
+    </div>
+    {f'<div style="font-size:0.65rem;color:var(--error);margin-top:0.3rem;padding:0 0.75rem 0.5rem">{_html.escape(err[:80])}</div>' if err else ''}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+            else:
+                # Processing / pending — shimmer skeleton
+                label = "↻ rerunning…" if is_rerunning else "⋯ generating"
+                st.markdown(f"""
+<div class="vid-card">
+  <div class="vid-ar-box" style="aspect-ratio:{ar_css}">
+    <div class="vid-skeleton"></div>
+    <div class="vid-skeleton-icon">🎬</div>
+  </div>
+  <div class="vid-footer">
+    <div class="vid-prompt-text">{_html.escape(prompt_text[:60])}{'…' if len(prompt_text) > 60 else ''}</div>
+    <div class="vid-meta">
+      <span class="vid-status-proc">{label}</span>
+      <span class="vid-ar-tag">{ar_raw}</span>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+            # ── Action buttons (below card) ───────────────────────────────────
+            is_approved = (job_id, i) in st.session_state.approved_set
+
+            if status in ("completed", "partial") and not is_rerunning:
+                btn_col1, btn_col2 = st.columns(2)
+
+                with btn_col1:
+                    if st.button("↻  Rerun", key=f"rerun_{job_id}_{i}", type="secondary"):
+                        ok = rerun_prompt(job_id, i)
+                        if ok:
+                            st.session_state.rerun_pending.add((job_id, i))
+                            # Remove from approved if it was queued
+                            st.session_state.approved_set.discard((job_id, i))
+                            st.rerun()
+                        else:
+                            st.error("Rerun failed — is the API running?")
+
+                with btn_col2:
+                    if is_approved:
+                        st.markdown(
+                            '<div style="text-align:center;font-family:Space Mono,monospace;'
+                            'font-size:0.65rem;color:var(--success);padding:0.3rem 0">✓ Approved</div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        if st.button("✓  Approve", key=f"approve_{job_id}_{i}"):
+                            item = approve_video(job_id, i)
+                            if item:
+                                st.session_state.approved_set.add((job_id, i))
+                                st.session_state.yt_queue = fetch_youtube_queue()
+                                st.rerun()
+                            else:
+                                st.error("Approve failed — is the API running?")
+
+            elif status == "failed" and not is_rerunning:
+                if st.button("↻  Retry", key=f"rerun_{job_id}_{i}", type="secondary"):
+                    ok = rerun_prompt(job_id, i)
+                    if ok:
+                        st.session_state.rerun_pending.add((job_id, i))
+                        st.rerun()
+                    else:
+                        st.error("Retry failed — is the API running?")
+
+            elif is_rerunning:
+                if status in ("completed", "failed"):
+                    st.session_state.rerun_pending.discard((job_id, i))
 
 
 def render_job_card(job: dict, live: bool = False):
@@ -463,8 +891,8 @@ def render_job_card(job: dict, live: bool = False):
                         st.markdown(f'<span style="color:var(--warn)">⋯</span> {text}', unsafe_allow_html=True)
 
                 with col_b:
-                    if vurl and pstatus == "completed":
-                        full_url = f"{API_BASE}{vurl}"
+                    if vurl and pstatus in ("completed", "partial"):
+                        full_url = vurl if vurl.startswith("http") else f"{API_BASE}{vurl}"
                         st.markdown(
                             f'<a class="dl-btn" href="{full_url}" target="_blank">⬇ Download</a>',
                             unsafe_allow_html=True,
@@ -527,7 +955,7 @@ st.markdown("""
 <div class="veo-sub">Google Veo 3.1 · Batch video generation · Native audio</div>
 """, unsafe_allow_html=True)
 
-tab_upload, tab_jobs = st.tabs(["🎬 Upload & Generate", "📊 Jobs"])
+tab_upload, tab_jobs, tab_metrics, tab_youtube = st.tabs(["🎬 Upload & Generate", "📊 Jobs", "📊 Metrics", "▶ YouTube Queue"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -581,9 +1009,13 @@ with tab_upload:
                 st.markdown(f'<div class="veo-alert veo-alert-error">✗ {err}</div>', unsafe_allow_html=True)
             st.stop()
 
-        # Drop empties
+        # Drop empties + metadata rows (notes rows have prompt text but no duration)
         df_clean = df_raw.dropna(subset=["prompt"])
         df_clean = df_clean[df_clean["prompt"].astype(str).str.strip() != ""]
+        if "duration" in df_clean.columns:
+            df_clean = df_clean[df_clean["duration"].apply(
+                lambda v: not (v is None or (isinstance(v, float) and __import__("math").isnan(v)))
+            )]
 
         if df_clean.empty:
             st.markdown('<div class="veo-alert veo-alert-error">No non-empty prompts found.</div>', unsafe_allow_html=True)
@@ -591,9 +1023,9 @@ with tab_upload:
 
         # ── Stats ──────────────────────────────────────────────────────────────
         total_rows  = len(df_clean)
-        total_dur   = int(df_clean["duration"].apply(lambda x: max(1, min(120, int(float(x))))).sum()) if "duration" in df_clean.columns else 0
-        total_clips = int(df_clean["duration"].apply(lambda x: -(-max(1, min(120, int(float(x)))) // 8)).sum()) if "duration" in df_clean.columns else 0
-        multi_count = int((df_clean["duration"].apply(lambda x: int(float(x))) > 8).sum()) if "duration" in df_clean.columns else 0
+        total_dur   = int(df_clean["duration"].apply(lambda x: _safe_int(x, 8, 1, 120)).sum()) if "duration" in df_clean.columns else 0
+        total_clips = int(df_clean["duration"].apply(lambda x: clip_count(_safe_int(x, 8, 1, 120))).sum()) if "duration" in df_clean.columns else 0
+        multi_count = int((df_clean["duration"].apply(lambda x: _safe_int(x, 8, 1, 120)) > 8).sum()) if "duration" in df_clean.columns else 0
 
         st.markdown(f"""
         <div class="stat-row">
@@ -630,7 +1062,20 @@ with tab_upload:
                 unsafe_allow_html=True,
             )
 
+        # Disable the button if the API is offline OR a job is already running.
+        # This prevents the polling rerun loop from re-firing the upload.
+        btn_disabled = btn_disabled or st.session_state.is_generating
+
+        if st.session_state.is_generating:
+            st.markdown(
+                '<div class="veo-alert veo-alert-info">⏳ Generation in progress — button locked until complete</div>',
+                unsafe_allow_html=True,
+            )
+
         if st.button("🚀 Start Veo Generation", disabled=btn_disabled):
+            # Lock immediately — before ANY async work — so that any rerun
+            # triggered during the upload sees the button as disabled.
+            st.session_state.is_generating = True
             with st.spinner("Uploading to Veo service…"):
                 try:
                     file_bytes = uploaded.read()
@@ -648,14 +1093,61 @@ with tab_upload:
 
                 except requests.exceptions.ConnectionError:
                     st.session_state.upload_error = "Cannot connect to API. Is veo_main.py running on port 8100?"
+                    st.session_state.is_generating = False
                 except Exception as e:
                     st.session_state.upload_error = str(e)
+                    st.session_state.is_generating = False
 
         if st.session_state.upload_error:
             st.markdown(
                 f'<div class="veo-alert veo-alert-error">✗ {st.session_state.upload_error}</div>',
                 unsafe_allow_html=True,
             )
+
+        # ── Video grid — appears below upload UI once a job is running ──────────
+        if st.session_state.active_job or st.session_state.get("last_completed_job"):
+            # Show grid for the active job, or the most recently completed one
+            display_job_id = (
+                st.session_state.active_job
+                or st.session_state.get("last_completed_job")
+            )
+            if display_job_id:
+                try:
+                    live_job = fetch_job(display_job_id)
+                    display_job = {
+                        **live_job.get("summary", {}),
+                        "prompts":  live_job.get("prompts", []),
+                        "status":   live_job.get("status", "processing"),
+                        "results":  {
+                            str(i): {
+                                "status":    p.get("status"),
+                                "video_url": p.get("video_url"),
+                                "clips_count": p.get("clips_count", 0),
+                                "duration_seconds": p.get("duration_seconds"),
+                                "error_message": p.get("error_message", ""),
+                            }
+                            for i, p in enumerate(live_job.get("prompts", []))
+                        },
+                        "job_id": display_job_id,
+                    }
+                    render_video_grid(display_job)
+
+                    # Auto-poll while job is still running.
+                    # We use st.rerun() with a small fragment sleep instead of
+                    # blocking the main thread with time.sleep() — a blocked
+                    # thread queues up browser clicks and causes duplicate submits.
+                    if live_job.get("status") in ("processing", "pending"):
+                        st.session_state.active_job = display_job_id
+                        time.sleep(POLL_INTERVAL)   # sleep is safe here — we're post-render
+                        st.rerun()
+                    else:
+                        # completed, partial, or failed — job is done
+                        # Store last_completed_job so grid keeps showing after active_job clears
+                        st.session_state.last_completed_job = display_job_id
+                        st.session_state.active_job         = None
+                        st.session_state.is_generating      = False  # unlock button
+                except Exception:
+                    pass
 
     else:
         # Empty state
@@ -720,4 +1212,313 @@ with tab_jobs:
     # Auto-refresh while a job is running
     if auto_refresh and st.session_state.active_job:
         time.sleep(POLL_INTERVAL)
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 3 — YouTube Queue
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_metrics:
+    st.markdown("### 📊 Live Generation Metrics")
+    st.caption("Updates every 5 seconds. Resets when veo_main.py restarts.")
+
+    def fetch_metrics() -> dict:
+        try:
+            r = requests.get(f"{API_BASE}/api/metrics", timeout=5)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return {}
+
+    m = fetch_metrics()
+
+    if not m:
+        st.warning("Cannot reach API — start veo_main.py first.")
+    else:
+        # ── Session overview ──────────────────────────────────────────────
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Jobs Processed", m.get("jobs_processed", 0))
+        with col2:
+            st.metric("Clips Generated", m["veo"]["clips_generated"])
+        with col3:
+            st.metric("Avg Clip Time", f"{m['veo']['avg_clip_time_s']}s")
+        with col4:
+            est = m.get("cost_estimate", {})
+            st.metric("Est. Cost (session)", f"₹{est.get('inr', 0):.2f}")
+
+        st.divider()
+
+        # ── Veo API ──────────────────────────────────────────────────────
+        st.markdown("#### 🎬 Veo API")
+        v = m["veo"]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Submissions",     v["submissions"])
+        c2.metric("Successes",       v["successes"])
+        c3.metric("Failures",        v["failures"],
+                  delta=f"-{v['failures']}" if v["failures"] else None,
+                  delta_color="inverse")
+        c4.metric("429 Rate Limits", v["rate_limit_hits"],
+                  delta=f"{v['rate_limit_pct']}%" if v["rate_limit_hits"] else None,
+                  delta_color="inverse")
+        c5.metric("Total Gen Time",  f"{v['total_gen_time_s']}s")
+
+        rl_pct = v["rate_limit_pct"]
+        if v["submissions"] == 0:
+            st.info("No submissions yet this session.")
+        elif rl_pct == 0:
+            st.success("✅ No rate limit hits this session")
+        elif rl_pct < 20:
+            st.warning(f"⚠️ {rl_pct}% of submissions hit rate limits")
+        else:
+            st.error(f"🔴 {rl_pct}% rate limit hit rate — reduce concurrency or upgrade quota")
+
+        st.divider()
+
+        # ── Decomposer ────────────────────────────────────────────────────
+        st.markdown("#### 🧠 Prompt Decomposer (AWS Bedrock)")
+        d = m["decomposer"]
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Nova 2 Lite Calls",  d["nova_calls"])
+        d2.metric("DeepSeek R1 Calls",  d["deepseek_calls"],
+                  delta=f"+{d['deepseek_calls']} fallbacks" if d["deepseek_calls"] else None,
+                  delta_color="inverse")
+        d3.metric("Deterministic",      d["deterministic"],
+                  delta=f"+{d['deterministic']} fallbacks" if d["deterministic"] else None,
+                  delta_color="inverse")
+        d4.metric("Input Tokens",       f"{d['input_tokens']:,}")
+        d5.metric("Output Tokens",      f"{d['output_tokens']:,}")
+
+        nova_cost_inr = (d["input_tokens"]  / 1000 * 0.000060 +
+                         d["output_tokens"] / 1000 * 0.000240) * 92.5
+        ds_cost_inr   = (d["input_tokens"]  / 1000 * 0.00135  +
+                         d["output_tokens"] / 1000 * 0.00540)  * 92.5
+        st.caption(
+            f"Bedrock cost — Nova: ₹{nova_cost_inr:.4f}  |  "
+            f"DeepSeek (if called): ₹{ds_cost_inr:.4f}"
+        )
+
+        st.divider()
+
+        # ── S3 ────────────────────────────────────────────────────────────
+        st.markdown("#### ☁️ S3 Uploads")
+        s = m["s3"]
+        s1, s2 = st.columns(2)
+        s1.metric("Succeeded", s["uploads_ok"])
+        s2.metric("Failed",    s["uploads_fail"],
+                  delta=f"-{s['uploads_fail']}" if s["uploads_fail"] else None,
+                  delta_color="inverse")
+
+        st.divider()
+
+        # ── Cost summary ──────────────────────────────────────────────────
+        st.markdown("#### 💰 Session Cost Estimate")
+        est = m.get("cost_estimate", {})
+        st.info(
+            f"**${est.get('usd', 0):.4f} USD  /  ₹{est.get('inr', 0):.2f} INR**  "
+            f"(primary model rate · successful clips only)  \n"
+            f"_{est.get('note', '')}_"
+        )
+
+    # Only auto-refresh metrics while a job is actively running.
+    # Unconditional rerun here competes with the generate tab polling loop
+    # and causes duplicate card rendering on every cycle.
+    if st.session_state.get("active_job") or st.session_state.get("is_generating"):
+        time.sleep(5)
+        st.rerun()
+
+with tab_youtube:
+    import html as _html
+
+    # ── YouTube connection status ─────────────────────────────────────────────
+    yt_status = fetch_youtube_status()
+    configured    = yt_status.get("configured", False)
+    authenticated = yt_status.get("authenticated", False)
+
+    if not configured:
+        st.markdown("""
+<div class="veo-alert veo-alert-error">
+⚠ <code>youtube_client_secrets.json</code> not found in project folder.<br>
+Download it from Google Cloud Console → APIs & Services → Credentials.
+</div>""", unsafe_allow_html=True)
+    elif not authenticated:
+        st.markdown("""
+<div class="veo-alert veo-alert-info">
+YouTube connected but not authenticated yet.<br>
+Click the button below to open a browser and approve access (one-time only).
+</div>""", unsafe_allow_html=True)
+        if st.button("🔐 Authenticate with YouTube"):
+            try:
+                r = requests.post(f"{API_BASE}/api/youtube/auth", timeout=120)
+                if r.status_code == 200:
+                    st.markdown('<div class="veo-alert veo-alert-success">✓ Authenticated successfully</div>',
+                                unsafe_allow_html=True)
+                    st.rerun()
+                else:
+                    st.error(f"Auth failed: {r.text}")
+            except Exception as e:
+                st.error(f"Auth error: {e}")
+    else:
+        st.markdown('<div class="veo-alert veo-alert-success">✓ YouTube connected and authenticated</div>',
+                    unsafe_allow_html=True)
+
+    st.markdown("<hr class='veo-divider'>", unsafe_allow_html=True)
+
+    # ── Queue header ──────────────────────────────────────────────────────────
+    col_title, col_upload = st.columns([3, 1])
+    with col_title:
+        st.markdown("### Upload Queue")
+        st.caption("Approve videos in the Generate tab → they appear here for review before upload.")
+
+    # Fetch fresh queue
+    queue = fetch_youtube_queue()
+    st.session_state.yt_queue = queue
+
+    approved_count  = sum(1 for q in queue if q["status"] == "approved")
+    uploaded_count  = sum(1 for q in queue if q["status"] == "uploaded")
+    uploading_count = sum(1 for q in queue if q["status"] == "uploading")
+    failed_count    = sum(1 for q in queue if q["status"] == "failed")
+
+    with col_upload:
+        st.markdown("<br>", unsafe_allow_html=True)
+        upload_disabled = approved_count == 0 or not authenticated
+        if st.button(
+            f"▶  Upload {approved_count} to YouTube" if approved_count > 0 else "▶  Upload to YouTube",
+            disabled=upload_disabled,
+            type="primary",
+        ):
+            result = trigger_youtube_upload()
+            if result.get("status") == "started":
+                st.markdown(
+                    f'<div class="veo-alert veo-alert-success">✓ Upload started — {result.get("count")} video(s)</div>',
+                    unsafe_allow_html=True,
+                )
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error(result.get("message", "Upload failed"))
+
+    # ── Stats row ─────────────────────────────────────────────────────────────
+    if queue:
+        st.markdown(f"""
+<div class="stat-row">
+    <div class="stat-card"><div class="stat-value">{len(queue)}</div><div class="stat-label">In Queue</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--warn)">{approved_count}</div><div class="stat-label">Approved</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--success)">{uploaded_count}</div><div class="stat-label">Uploaded</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--error)">{failed_count}</div><div class="stat-label">Failed</div></div>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("<hr class='veo-divider'>", unsafe_allow_html=True)
+
+    # ── Queue items ───────────────────────────────────────────────────────────
+    if not queue:
+        st.markdown("""
+<div style="text-align:center;padding:3rem 0;color:var(--muted)">
+    <div style="font-size:2rem;margin-bottom:0.75rem">▶</div>
+    <div>No videos in the upload queue yet.</div>
+    <div style="font-family:Space Mono,monospace;font-size:0.75rem;margin-top:0.5rem">
+        Generate videos → click ✓ Approve on any completed video
+    </div>
+</div>""", unsafe_allow_html=True)
+    else:
+        for item in queue:
+            qid       = item["queue_id"]
+            status    = item["status"]
+            yt_url    = item.get("youtube_url")
+            video_url = item.get("video_url", "")
+            err       = item.get("error", "")
+
+            status_colors = {
+                "approved":  "var(--warn)",
+                "uploading": "var(--accent)",
+                "uploaded":  "var(--success)",
+                "failed":    "var(--error)",
+            }
+            status_labels = {
+                "approved":  "⏳ Approved — ready to upload",
+                "uploading": "⬆ Uploading…",
+                "uploaded":  "✓ Uploaded to YouTube",
+                "failed":    "✗ Upload failed",
+            }
+            sc = status_colors.get(status, "var(--muted)")
+            sl = status_labels.get(status, status)
+
+            card_class = f"yt-queue-card {status}"
+            st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
+
+            card_col1, card_col2 = st.columns([1, 2])
+
+            with card_col1:
+                if video_url:
+                    full_url = video_url if video_url.startswith("http") else f"{API_BASE}{video_url}"
+                    st.markdown(
+                        f'<video class="yt-video-thumb" src="{_html.escape(full_url)}" preload="metadata"></video>',
+                        unsafe_allow_html=True,
+                    )
+                if yt_url:
+                    st.markdown(
+                        f'<a class="yt-link" href="{yt_url}" target="_blank">▶ Watch on YouTube →</a>',
+                        unsafe_allow_html=True,
+                    )
+
+            with card_col2:
+                st.markdown(
+                    f'<div style="font-family:Space Mono,monospace;font-size:0.65rem;color:{sc};margin-bottom:0.5rem">{sl}</div>',
+                    unsafe_allow_html=True,
+                )
+                if err:
+                    st.markdown(
+                        f'<div style="font-size:0.7rem;color:var(--error);margin-bottom:0.5rem">{_html.escape(err[:120])}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Editable fields — only shown for approved/failed (not uploaded/uploading)
+                if status in ("approved", "failed"):
+                    new_title = st.text_input(
+                        "Title",
+                        value=item.get("title", ""),
+                        max_chars=100,
+                        key=f"yt_title_{qid}",
+                    )
+                    new_desc = st.text_area(
+                        "Description",
+                        value=item.get("description", ""),
+                        height=100,
+                        key=f"yt_desc_{qid}",
+                    )
+                    tags_str = st.text_input(
+                        "Tags (comma-separated)",
+                        value=", ".join(item.get("tags", [])),
+                        key=f"yt_tags_{qid}",
+                    )
+                    new_tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+                    btn_c1, btn_c2 = st.columns(2)
+                    with btn_c1:
+                        if st.button("💾  Save", key=f"yt_save_{qid}", type="secondary"):
+                            ok = update_queue_item(qid, new_title, new_desc, new_tags)
+                            if ok:
+                                st.markdown(
+                                    '<div class="veo-alert veo-alert-success" style="padding:0.4rem 0.8rem;font-size:0.8rem">Saved</div>',
+                                    unsafe_allow_html=True,
+                                )
+                                st.rerun()
+                    with btn_c2:
+                        if st.button("🗑  Remove", key=f"yt_remove_{qid}", type="secondary"):
+                            remove_from_queue(qid)
+                            st.rerun()
+                else:
+                    # Read-only view for uploaded/uploading
+                    st.markdown(f"**{_html.escape(item.get('title', ''))}**")
+                    st.caption(item.get("description", "")[:200])
+                    if item.get("tags"):
+                        st.caption("Tags: " + ", ".join(item["tags"][:8]))
+
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown("")
+
+    # Auto-refresh while uploads are in progress
+    if uploading_count > 0:
+        time.sleep(3)
         st.rerun()

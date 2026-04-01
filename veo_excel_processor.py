@@ -99,21 +99,27 @@ def validate_excel_file(file_path: str) -> Tuple[bool, List[str]]:
     if df.empty:
         return False, ["File contains no data rows"]
 
-    # Row-level validation
+    # Row-level validation — blank rows (no prompt) are skipped, not errors.
+    # This matches create_job_from_excel() which also drops prompt-empty rows.
+    import math as _math
     for idx, row in df.iterrows():
         row_num = idx + 2  # 1-based, header offset
 
         prompt = str(row.get("prompt", "")).strip()
-        if not prompt:
-            errors.append(f"Row {row_num}: 'prompt' is empty")
+        if not prompt or prompt.lower() in ("nan", "none"):
+            continue  # blank row — skip silently
 
+        dur_raw = row.get("duration")
         try:
-            dur = int(float(row.get("duration", 0)))
-            if not (_MIN_DURATION <= dur <= _MAX_DURATION):
-                errors.append(
-                    f"Row {row_num}: duration {dur}s out of range "
-                    f"({_MIN_DURATION}–{_MAX_DURATION}s)"
-                )
+            if dur_raw is None or (isinstance(dur_raw, float) and _math.isnan(dur_raw)):
+                pass  # missing duration — silently default to 8s in create_job_from_excel
+            else:
+                dur = int(float(dur_raw))
+                if not (_MIN_DURATION <= dur <= _MAX_DURATION):
+                    errors.append(
+                        f"Row {row_num}: duration {dur}s out of range "
+                        f"({_MIN_DURATION}–{_MAX_DURATION}s)"
+                    )
         except (ValueError, TypeError):
             errors.append(f"Row {row_num}: 'duration' is not a valid number")
 
@@ -164,6 +170,17 @@ def create_job_from_excel(
     df = df.dropna(subset=["prompt"])
     df["prompt"] = df["prompt"].astype(str).str.strip()
     df = df[df["prompt"] != ""]
+    # Drop metadata/notes rows: have prompt text but no duration.
+    # These are template annotation rows (e.g. "★ Required: prompt...") that
+    # pandas reads as data rows because they have text in column A.
+    import math as _math
+    def _has_duration(v) -> bool:
+        try:
+            f = float(v)
+            return not _math.isnan(f)
+        except (TypeError, ValueError):
+            return False
+    df = df[df["duration"].apply(_has_duration)]
 
     job_id = f"job_{uuid.uuid4().hex[:8]}"
     now    = datetime.now(timezone.utc).isoformat()
@@ -181,10 +198,13 @@ def create_job_from_excel(
         prompt_text = str(row.get("prompt", "")).strip()
 
         try:
-            duration = max(
-                _MIN_DURATION,
-                min(_MAX_DURATION, int(float(row.get("duration", 8)))),
-            )
+            import math as _math
+            _dur_raw = row.get("duration", 8)
+            _dur_f   = float(_dur_raw) if _dur_raw is not None else float("nan")
+            if _math.isnan(_dur_f):
+                duration = 8
+            else:
+                duration = max(_MIN_DURATION, min(_MAX_DURATION, int(_dur_f)))
         except (ValueError, TypeError):
             duration = 8
             logger.warning(f"   Row {row_num}: invalid duration — defaulting to 8s")

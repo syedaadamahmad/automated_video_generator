@@ -27,6 +27,7 @@ Port 8100 avoids collision with the Nova/Runway service on 8000.
 
 import asyncio
 import logging
+import os
 import sys
 import time
 import uuid
@@ -134,17 +135,53 @@ if not veo_generator:
     main_logger.critical("Cannot start without a Veo generator. Exiting.")
     sys.exit(1)
 
+from veo_s3 import VeoS3Client
+veo_s3 = VeoS3Client(
+    bucket = os.getenv("VEO_S3_BUCKET", ""),
+    region = os.getenv("VEO_S3_REGION", "us-east-1"),
+)
+main_logger.info(f"OK VeoS3Client — {'enabled' if veo_s3.enabled else 'disabled (local only)'}")
+
 from veo_orchestrator import VeoOrchestrator
 veo_orchestrator = VeoOrchestrator(
     generator     = veo_generator,
     stitcher      = video_stitcher,
     decomposer    = prompt_decomposer,
     clip_duration = config.VEO_CLIP_DURATION_SECONDS,
+    s3_client     = veo_s3,
 )
 main_logger.info("OK VeoOrchestrator initialised")
 
 # ── Job store ─────────────────────────────────────────────────────────────────
 jobs: Dict[str, Any] = {}
+
+# ── Live metrics store ────────────────────────────────────────────────────────
+# Updated in real-time by generator and decomposer via push.
+# Resets on server restart — tracks current session only.
+_metrics: Dict[str, Any] = {
+    # Veo API
+    "veo_submissions":      0,   # total API calls attempted
+    "veo_successes":        0,   # successful completions
+    "veo_failures":         0,   # all failures (any error)
+    "veo_rate_limit_hits":  0,   # 429 errors specifically
+    "veo_clips_generated":  0,   # clips that produced a video file
+    "veo_generation_time_s": 0.0, # cumulative generation time
+
+    # Bedrock decomposer
+    "decomp_nova_calls":       0,
+    "decomp_deepseek_calls":   0,
+    "decomp_deterministic":    0,
+    "decomp_input_tokens":     0,
+    "decomp_output_tokens":    0,
+
+    # S3
+    "s3_uploads_ok":    0,
+    "s3_uploads_fail":  0,
+
+    # Session
+    "session_start":    None,   # set on first job
+    "jobs_processed":   0,
+}
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -191,6 +228,64 @@ async def health_check():
         "decomposer_mode": (
             "bedrock_nova_deepseek" if prompt_decomposer._bedrock_client else "deterministic_fallback"
         ),
+    }
+
+
+@app.get("/api/metrics")
+async def get_metrics():
+    """Real-time generation metrics for the Streamlit dashboard."""
+    import time
+    from datetime import datetime, timezone
+
+    # Derived metrics
+    total_veo   = _metrics["veo_submissions"]
+    rl_rate     = (
+        round(_metrics["veo_rate_limit_hits"] / total_veo * 100, 1)
+        if total_veo > 0 else 0.0
+    )
+    avg_clip_s  = (
+        round(_metrics["veo_generation_time_s"] / _metrics["veo_clips_generated"], 1)
+        if _metrics["veo_clips_generated"] > 0 else 0.0
+    )
+
+    # Estimated cost (clips × 8s × $0.40 for primary model)
+    est_cost_usd = _metrics["veo_clips_generated"] * 8 * 0.40
+    est_cost_inr = est_cost_usd * 92.5  # approximate; live rate not fetched here
+
+    return {
+        "session_start":        _metrics["session_start"],
+        "jobs_processed":       _metrics["jobs_processed"],
+
+        "veo": {
+            "submissions":      _metrics["veo_submissions"],
+            "successes":        _metrics["veo_successes"],
+            "failures":         _metrics["veo_failures"],
+            "rate_limit_hits":  _metrics["veo_rate_limit_hits"],
+            "rate_limit_pct":   rl_rate,
+            "clips_generated":  _metrics["veo_clips_generated"],
+            "avg_clip_time_s":  avg_clip_s,
+            "total_gen_time_s": round(_metrics["veo_generation_time_s"], 1),
+        },
+
+        "decomposer": {
+            "nova_calls":        _metrics["decomp_nova_calls"],
+            "deepseek_calls":    _metrics["decomp_deepseek_calls"],
+            "deterministic":     _metrics["decomp_deterministic"],
+            "input_tokens":      _metrics["decomp_input_tokens"],
+            "output_tokens":     _metrics["decomp_output_tokens"],
+            "total_tokens":      _metrics["decomp_input_tokens"] + _metrics["decomp_output_tokens"],
+        },
+
+        "s3": {
+            "uploads_ok":   _metrics["s3_uploads_ok"],
+            "uploads_fail": _metrics["s3_uploads_fail"],
+        },
+
+        "cost_estimate": {
+            "usd": round(est_cost_usd, 4),
+            "inr": round(est_cost_inr, 2),
+            "note": "Primary model rate ($0.40/s). Check GCP console for exact billing.",
+        },
     }
 
 
@@ -321,59 +416,125 @@ async def upload_excel(
     }
 
 
+# ── Concurrency config ────────────────────────────────────────────────────────
+
+# Max prompts running simultaneously within one job.
+# Veo 3.0 free tier: 2 requests per minute, 50 per day.
+# Each prompt with 4 clips = 4 sequential API calls.
+# At concurrency=2, clip submissions from two prompts can overlap
+# and exceed the 2 RPM limit. Set to 1 for reliable operation
+# on the free tier. Increase if you have a paid quota.
+_PROMPT_CONCURRENCY = 1
+
+
 # ── Background generation job ─────────────────────────────────────────────────
 
 async def run_generation_job(job_id: str) -> None:
     """
-    Process each prompt sequentially. Veo produces video + audio in one API
-    call — no mixing, no narration, no post-processing needed.
+    Process prompts concurrently (up to _PROMPT_CONCURRENCY at once).
+
+    Design:
+    - asyncio.Semaphore gates concurrent access — at most 5 prompts call Veo simultaneously.
+    - asyncio.Lock protects writes to the shared jobs[job_id] dict (completed/failed counters).
+    - Within each prompt, clips are sequential — clip N+1 waits for clip N's last frame.
+    - Results are stored by index key str(i) — API schema unchanged.
+    - Progress percent is updated after each prompt completes (order-independent).
     """
-    generation_logger.info(f"[JOB_{job_id}] Starting")
+    generation_logger.info(f"[JOB_{job_id}] Starting — {_PROMPT_CONCURRENCY} concurrent")
     start_time   = time.time()
+
+    # Track session start on first job
+    if _metrics["session_start"] is None:
+        from datetime import datetime, timezone
+        _metrics["session_start"] = datetime.now(timezone.utc).isoformat()
+    _metrics["jobs_processed"] += 1
     job          = jobs[job_id]
     prompts_data = job["prompts"]
     total        = len(prompts_data)
 
-    jobs[job_id]["results"] = {}
+    jobs[job_id]["results"]            = {}
+    jobs[job_id]["completed_prompts"]  = 0
+    jobs[job_id]["failed_prompts"]     = 0
+    jobs[job_id]["generation_status"]  = f"Running — 0/{total} complete"
 
-    for i, prompt_data in enumerate(prompts_data):
-        if job_id not in jobs:
-            generation_logger.warning(f"[JOB_{job_id}] Job deleted mid-run — stopping")
-            break
+    semaphore  = asyncio.Semaphore(_PROMPT_CONCURRENCY)
+    state_lock = asyncio.Lock()   # guards counter/status writes on jobs[job_id]
 
+    async def _run_prompt(i: int, prompt_data: dict) -> None:
+        """
+        Semaphore-gated coroutine for a single prompt.
+        Clips within this prompt run sequentially inside generate_for_prompt().
+        """
         prompt_text = prompt_data["text"]
         duration    = prompt_data["duration"]
 
-        jobs[job_id]["generation_status"] = f"Processing prompt {i + 1}/{total}"
-        generation_logger.info(f"[JOB_{job_id}] Prompt {i + 1}/{total} | {duration}s")
-        generation_logger.info(f"   '{prompt_text[:100]}{'...' if len(prompt_text) > 100 else ''}'")
+        async with semaphore:
+            if job_id not in jobs:
+                generation_logger.warning(f"[JOB_{job_id}] Job deleted — skipping prompt {i + 1}")
+                return
 
-        prompt_start = time.time()
+            generation_logger.info(f"[JOB_{job_id}] Prompt {i + 1}/{total} | {duration}s [START]")
+            generation_logger.info(f"   '{prompt_text[:100]}{'...' if len(prompt_text) > 100 else ''}'")
+            prompt_start = time.time()
 
-        result = await veo_orchestrator.generate_for_prompt(
-            prompt_data  = prompt_data,
-            job_id       = job_id,
-            prompt_index = i,
-        )
-
-        jobs[job_id]["results"][str(i)] = result
-        elapsed = time.time() - prompt_start
-
-        if result.get("status") in ("completed", "partial"):
-            jobs[job_id]["completed_prompts"] = jobs[job_id].get("completed_prompts", 0) + 1
-            generation_logger.info(
-                f"   Done in {elapsed:.1f}s -> {result.get('video_url')} "
-                f"({'stitched' if result.get('stitched') else 'single'}, "
-                f"{result.get('clips_count', 1)} clip(s))"
+            result = await veo_orchestrator.generate_for_prompt(
+                prompt_data  = prompt_data,
+                job_id       = job_id,
+                prompt_index = i,
             )
-            progress_logger.info(f"[{i + 1}/{total}] {result.get('video_url')}")
-        else:
-            jobs[job_id]["failed_prompts"] = jobs[job_id].get("failed_prompts", 0) + 1
-            generation_logger.error(f"   Failed after {elapsed:.1f}s: {result.get('error_message')}")
 
-        jobs[job_id]["progress_percent"] = ((i + 1) / total) * 100
+            elapsed = time.time() - prompt_start
 
-    # Finalise
+        # ── Update shared state (outside semaphore — IO-free, lock-protected) ──
+        async with state_lock:
+            jobs[job_id]["results"][str(i)] = result
+
+            # ── Push result stats into live metrics ───────────────────────────
+            _metrics["veo_submissions"]     += result.get("api_calls_made", 1)
+            _metrics["veo_rate_limit_hits"] += result.get("rate_limit_hits", 0)
+            # Decomposer token tracking
+            _metrics["decomp_input_tokens"]   += result.get("decomp_input_tokens", 0)
+            _metrics["decomp_output_tokens"]  += result.get("decomp_output_tokens", 0)
+            _metrics["decomp_nova_calls"]     += result.get("decomp_nova_calls", 0)
+            _metrics["decomp_deepseek_calls"] += result.get("decomp_deepseek_calls", 0)
+            _metrics["decomp_deterministic"]  += result.get("decomp_deterministic", 0)
+            # S3 tracking
+            _metrics["s3_uploads_ok"]   += result.get("s3_upload_ok", 0)
+            _metrics["s3_uploads_fail"] += result.get("s3_upload_fail", 0)
+
+            if result.get("status") in ("completed", "partial"):
+                jobs[job_id]["completed_prompts"] += 1
+                _metrics["veo_successes"]       += 1
+                _metrics["veo_clips_generated"] += result.get("clips_count", 1)
+                _metrics["veo_generation_time_s"] += result.get("generation_time_seconds", 0) or 0
+                generation_logger.info(
+                    f"[JOB_{job_id}] Prompt {i + 1}/{total} done in {elapsed:.1f}s "
+                    f"-> {result.get('video_url')} "
+                    f"({'stitched' if result.get('stitched') else 'single'}, "
+                    f"{result.get('clips_count', 1)} clip(s))"
+                )
+                progress_logger.info(f"[{i + 1}/{total}] {result.get('video_url')}")
+            else:
+                jobs[job_id]["failed_prompts"] += 1
+                _metrics["veo_failures"] += 1
+                generation_logger.error(
+                    f"[JOB_{job_id}] Prompt {i + 1}/{total} failed after {elapsed:.1f}s: "
+                    f"{result.get('error_message')}"
+                )
+
+            done_so_far = (
+                jobs[job_id]["completed_prompts"] + jobs[job_id]["failed_prompts"]
+            )
+            jobs[job_id]["progress_percent"]   = (done_so_far / total) * 100
+            jobs[job_id]["generation_status"]  = (
+                f"Running — {done_so_far}/{total} complete"
+            )
+
+    # ── Launch all prompt coroutines; gather waits for all to finish ──────────
+    tasks = [_run_prompt(i, pd) for i, pd in enumerate(prompts_data)]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ── Finalise ──────────────────────────────────────────────────────────────
     total_elapsed = time.time() - start_time
     failed_count  = jobs[job_id].get("failed_prompts", 0)
 
@@ -392,6 +553,316 @@ async def run_generation_job(job_id: str) -> None:
             Path(temp_file).unlink(missing_ok=True)
     except Exception as e:
         generation_logger.warning(f"[JOB_{job_id}] Could not delete temp file: {e}")
+
+
+# ── Rerun single prompt ───────────────────────────────────────────────────────
+
+@app.post("/api/jobs/{job_id}/rerun/{prompt_index}")
+async def rerun_prompt(job_id: str, prompt_index: int, background_tasks: BackgroundTasks):
+    """
+    Re-run a single prompt within an existing job.
+
+    Flow:
+    - Validates job and prompt exist
+    - Marks the result as "processing" immediately (UI picks this up on next poll)
+    - Schedules a background task that calls the orchestrator for just that one prompt
+    - Returns immediately so the UI is never blocked
+
+    Used by: rerun button on each video card in the frontend.
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    job = jobs[job_id]
+    prompts_data = job.get("prompts", [])
+
+    if prompt_index < 0 or prompt_index >= len(prompts_data):
+        raise HTTPException(
+            status_code=400,
+            detail=f"prompt_index {prompt_index} out of range (job has {len(prompts_data)} prompts)"
+        )
+
+    prompt_data = prompts_data[prompt_index]
+
+    # Mark as processing immediately so frontend shows skeleton
+    jobs[job_id].setdefault("results", {})[str(prompt_index)] = {
+        "status": "processing",
+        "video_url": None,
+    }
+    # Reset counters to reflect the rerun
+    jobs[job_id]["status"] = "processing"
+
+    generation_logger.info(
+        f"[JOB_{job_id}] Rerun requested — prompt {prompt_index + 1} "
+        f"'{prompt_data.get('text', '')[:60]}...'"
+    )
+
+    async def _rerun():
+        try:
+            result = await veo_orchestrator.generate_for_prompt(
+                prompt_data  = prompt_data,
+                job_id       = job_id,
+                prompt_index = prompt_index,
+            )
+            jobs[job_id]["results"][str(prompt_index)] = result
+
+            # Recompute job-level status from all results
+            all_results = jobs[job_id].get("results", {})
+            total = len(prompts_data)
+            completed = sum(
+                1 for r in all_results.values()
+                if r.get("status") in ("completed", "partial")
+            )
+            failed = sum(
+                1 for r in all_results.values()
+                if r.get("status") == "failed"
+            )
+            processing = sum(
+                1 for r in all_results.values()
+                if r.get("status") == "processing"
+            )
+
+            if processing == 0:
+                jobs[job_id]["status"] = "completed" if failed == 0 else "partial"
+                jobs[job_id]["completed_prompts"] = completed
+                jobs[job_id]["failed_prompts"]    = failed
+                jobs[job_id]["progress_percent"]  = 100.0
+
+            generation_logger.info(
+                f"[JOB_{job_id}] Rerun prompt {prompt_index + 1} done — "
+                f"status={result.get('status')}"
+            )
+        except Exception as e:
+            jobs[job_id]["results"][str(prompt_index)] = {
+                "status": "failed",
+                "error_message": str(e),
+            }
+            generation_logger.error(
+                f"[JOB_{job_id}] Rerun prompt {prompt_index + 1} error: {e}"
+            )
+
+    # Soft-delete the old S3 video before rerunning
+    # (moves to rejected/{job_id}/prompt_{N}/ — not hard deleted)
+    if veo_s3.enabled:
+        moved = veo_s3.soft_delete_video(job_id=job_id, prompt_index=prompt_index)
+        if moved:
+            generation_logger.info(
+                f"[JOB_{job_id}] S3 soft-delete OK — prompt {prompt_index + 1} moved to rejected/"
+            )
+        else:
+            generation_logger.warning(
+                f"[JOB_{job_id}] S3 soft-delete skipped — no existing object or S3 error"
+            )
+
+    background_tasks.add_task(_rerun)
+
+    return {
+        "status":        "accepted",
+        "job_id":        job_id,
+        "prompt_index":  prompt_index,
+        "message":       f"Rerun started for prompt {prompt_index + 1}",
+    }
+
+
+# ── YouTube upload queue ──────────────────────────────────────────────────────
+# In-memory queue: { queue_id: { job_id, prompt_index, title, description,
+#                                tags, local_path, s3_url, status, youtube_url } }
+# "approved" = waiting to upload, "uploading" = in progress,
+# "uploaded" = done, "failed" = error
+youtube_queue: Dict[str, Any] = {}
+
+
+import veo_youtube as _yt
+
+
+@app.get("/api/youtube/status")
+async def youtube_status():
+    """Check if YouTube is configured and authenticated."""
+    return {
+        "configured":    _yt.is_configured(),
+        "authenticated": _yt.is_authenticated(),
+        "secrets_file":  str(_yt.SECRETS_FILE),
+    }
+
+
+@app.post("/api/youtube/auth")
+async def youtube_auth():
+    """
+    Trigger the OAuth browser flow.
+    Opens a browser tab — user logs in, approves, token is saved.
+    Returns immediately after auth completes.
+    """
+    try:
+        _yt.get_authenticated_service()
+        return {"status": "authenticated"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/jobs/{job_id}/approve/{prompt_index}")
+async def approve_video(job_id: str, prompt_index: int):
+    """
+    Approve a completed video — adds it to the YouTube upload queue.
+
+    Auto-generates title/description/tags from the prompt.
+    User edits these in the UI before triggering upload.
+
+    Returns the queue_id so the frontend can reference this queue entry.
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    job      = jobs[job_id]
+    prompts  = job.get("prompts", [])
+    results  = job.get("results", {})
+
+    if prompt_index < 0 or prompt_index >= len(prompts):
+        raise HTTPException(status_code=400, detail="prompt_index out of range")
+
+    result = results.get(str(prompt_index), {})
+    if result.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Video is not completed yet")
+
+    prompt_text = prompts[prompt_index].get("text", "")
+    video_url   = result.get("video_url", "")
+    local_path  = result.get("local_video_url") or video_url  # prefer local for upload
+    s3_url      = result.get("s3_url", "")
+
+    # Strip /videos/ prefix from local URL if it's a FastAPI-served path
+    if local_path and local_path.startswith("/videos/"):
+        from pathlib import Path as _Path
+        output_dir = _Path(__file__).parent / "outputs" / "videos"
+        local_path = str(output_dir / _Path(local_path).name)
+
+    metadata  = _yt.generate_metadata(prompt_text)
+    queue_id  = f"q_{job_id}_{prompt_index}"
+
+    youtube_queue[queue_id] = {
+        "queue_id":     queue_id,
+        "job_id":       job_id,
+        "prompt_index": prompt_index,
+        "prompt_text":  prompt_text[:120],
+        "local_path":   local_path,
+        "s3_url":       s3_url,
+        "video_url":    video_url,
+        "title":        metadata["title"],
+        "description":  metadata["description"],
+        "tags":         metadata["tags"],
+        "status":       "approved",
+        "youtube_url":  None,
+        "error":        None,
+    }
+
+    generation_logger.info(
+        f"[YOUTUBE] Queued for upload: {queue_id} — '{metadata['title'][:60]}'"
+    )
+
+    return youtube_queue[queue_id]
+
+
+@app.get("/api/youtube/queue")
+async def get_youtube_queue():
+    """Return all items in the upload queue."""
+    return {"queue": list(youtube_queue.values())}
+
+
+@app.patch("/api/youtube/queue/{queue_id}")
+async def update_queue_item(queue_id: str, body: dict):
+    """
+    Update editable metadata for a queued video before upload.
+    Accepts: { title, description, tags }
+    """
+    if queue_id not in youtube_queue:
+        raise HTTPException(status_code=404, detail=f"Queue item {queue_id} not found")
+
+    item = youtube_queue[queue_id]
+    if item["status"] not in ("approved", "failed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot edit item with status '{item['status']}'"
+        )
+
+    if "title" in body:
+        item["title"]       = str(body["title"])[:100]
+    if "description" in body:
+        item["description"] = str(body["description"])[:5000]
+    if "tags" in body and isinstance(body["tags"], list):
+        item["tags"]        = [str(t).strip() for t in body["tags"] if str(t).strip()]
+
+    return item
+
+
+@app.post("/api/youtube/upload")
+async def upload_to_youtube(background_tasks: BackgroundTasks):
+    """
+    Upload ALL approved queue items to YouTube.
+
+    Runs in background — returns immediately.
+    Poll /api/youtube/queue to track per-item status.
+    """
+    approved = [
+        item for item in youtube_queue.values()
+        if item["status"] == "approved"
+    ]
+
+    if not approved:
+        raise HTTPException(status_code=400, detail="No approved videos in queue")
+
+    if not _yt.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="YouTube not configured — youtube_client_secrets.json missing"
+        )
+
+    async def _upload_all():
+        for item in approved:
+            qid = item["queue_id"]
+            youtube_queue[qid]["status"] = "uploading"
+            generation_logger.info(f"[YOUTUBE] Uploading {qid} — '{item['title'][:60]}'")
+
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda i=item: _yt.upload_video(
+                    local_path  = i["local_path"],
+                    title       = i["title"],
+                    description = i["description"],
+                    tags        = i["tags"],
+                    privacy     = "public",
+                ),
+            )
+
+            if result["status"] == "uploaded":
+                youtube_queue[qid]["status"]      = "uploaded"
+                youtube_queue[qid]["youtube_url"] = result["youtube_url"]
+                youtube_queue[qid]["youtube_id"]  = result["youtube_id"]
+                generation_logger.info(
+                    f"[YOUTUBE] ✅ {qid} uploaded → {result['youtube_url']}"
+                )
+            else:
+                youtube_queue[qid]["status"] = "failed"
+                youtube_queue[qid]["error"]  = result.get("error", "unknown")
+                generation_logger.error(
+                    f"[YOUTUBE] ❌ {qid} failed: {result.get('error')}"
+                )
+
+    background_tasks.add_task(_upload_all)
+
+    return {
+        "status":  "started",
+        "count":   len(approved),
+        "message": f"Uploading {len(approved)} video(s) to YouTube",
+    }
+
+
+@app.delete("/api/youtube/queue/{queue_id}")
+async def remove_from_queue(queue_id: str):
+    """Remove an item from the upload queue (before it's uploaded)."""
+    if queue_id not in youtube_queue:
+        raise HTTPException(status_code=404, detail=f"Queue item {queue_id} not found")
+    if youtube_queue[queue_id]["status"] == "uploading":
+        raise HTTPException(status_code=400, detail="Cannot remove item currently uploading")
+    del youtube_queue[queue_id]
+    return {"status": "removed", "queue_id": queue_id}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

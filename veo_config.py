@@ -35,6 +35,12 @@ class VeoConfig:
     AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID",     "")
     AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
     AWS_DEFAULT_REGION    = os.getenv("AWS_DEFAULT_REGION",    "us-east-1")
+    
+    STITCH_CROSSFADE  = os.getenv("STITCH_CROSSFADE", "false").lower() == "true"
+    # Duration of crossfade overlap between clips in seconds (default 0.5s)
+    STITCH_CROSSFADE_DURATION = float(os.getenv("STITCH_CROSSFADE_DURATION", "0.5"))
+    # Audio fade duration at each stitch point in seconds (default 0.3s)
+    STITCH_AUDIO_FADE         = float(os.getenv("STITCH_AUDIO_FADE", "0.3"))
 
     # ── Veo Model Selection ───────────────────────────────────────────────────
     # Primary model — best quality, native audio+video.

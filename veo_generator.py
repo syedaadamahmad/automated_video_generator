@@ -146,21 +146,25 @@ class VeoGenerator:
         prompt_index: int = 0,
         clip_label: Optional[str] = None,
         generate_audio: Optional[bool] = None,
+        reference_image_path: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """
         Generate a single Veo video clip.
 
         Args:
-            prompt:         Video description sent to Veo.
-            duration:       Requested duration (ignored for Veo — always 8s per clip).
-                            Kept for interface parity with RunwayGenerator.
-            job_id:         Job identifier used in output filename.
-            prompt_index:   Prompt row index (used in filename if clip_label not set).
-            clip_label:     Optional clip sequence label e.g. "p1_clip_001".
-                            When set, filename encodes clip order for VideoStitcher.
-            generate_audio: Per-call override for native audio flag (bookkeeping only).
-                            Does not affect the API request — Veo generates audio
-                            natively and the field is not accepted by GenerateVideosConfig.
+            prompt:               Video description sent to Veo.
+            duration:             Requested duration (ignored for Veo — always 8s per clip).
+                                  Kept for interface parity with RunwayGenerator.
+            job_id:               Job identifier used in output filename.
+            prompt_index:         Prompt row index (used in filename if clip_label not set).
+            clip_label:           Optional clip sequence label e.g. "p1_clip_001".
+                                  When set, filename encodes clip order for VideoStitcher.
+            generate_audio:       Per-call override for native audio flag (bookkeeping only).
+                                  Does not affect the API request — Veo generates audio
+                                  natively and the field is not accepted by GenerateVideosConfig.
+            reference_image_path: Optional path to a JPEG/PNG to use as the first-frame
+                                  anchor (img2vid). When set, Veo generates the clip
+                                  continuing from this image — used for cross-clip continuity.
 
         Returns:
             {
@@ -182,38 +186,103 @@ class VeoGenerator:
         logger.info(f"   🆔 Job ID     : {job_id}")
         logger.info(f"   🏷️  Clip label : {clip_label or '(none)'}")
         logger.info(f"   🔊 Audio      : {'native (Veo-controlled)' if use_audio else 'muted (post-process)'}")
+        logger.info(f"   🖼️  Ref image  : {reference_image_path.name if reference_image_path else '(none — text-to-video)' }")
 
-        # Try primary model, fall back automatically on failure
-        for model, label in [
-            (self.model_primary,  "PRIMARY"),
-            (self.model_fallback, "FALLBACK"),
-        ]:
+        # Build attempt sequence:
+        # 1. Primary   — with reference image (img2vid) if provided
+        # 2. Fallback  — with reference image (img2vid) if provided
+        # 3. Primary   — text-only (if img2vid failed on both; content policy guard)
+        # 4. Fallback  — text-only (last resort)
+        #
+        # VEO_NO_VIDEO on img2vid = silent content policy block (e.g. minors in frame).
+        # Degrading to text-only lets generation continue with narrative continuity
+        # preserved by the prompt even when visual chaining is blocked.
+        has_image = reference_image_path is not None
+        # Metrics counters — accumulated across all attempts and returned in result
+        _api_calls_made  = 0
+        _rate_limit_hits = 0
+
+        attempts = [
+            (self.model_primary,  "PRIMARY",  reference_image_path),
+            (self.model_fallback, "FALLBACK", reference_image_path),
+        ]
+        if has_image:
+            # Add text-only fallbacks in case img2vid is blocked
+            attempts += [
+                (self.model_primary,  "PRIMARY-TEXT",  None),
+                (self.model_fallback, "FALLBACK-TEXT", None),
+            ]
+
+        for model, label, img_path in attempts:
+            is_text_only_retry = has_image and img_path is None
+            if is_text_only_retry:
+                logger.warning(
+                    f"   ⚠️  img2vid blocked (VEO_NO_VIDEO) — retrying [{label}] as text-only"
+                )
+
+            _api_calls_made += 1
             result = await self._attempt_generation(
-                prompt       = prompt,
-                model        = model,
-                model_label  = label,
-                job_id       = job_id,
-                prompt_index = prompt_index,
-                clip_label   = clip_label,
-                use_audio    = use_audio,
+                prompt                = prompt,
+                model                 = model,
+                model_label           = label,
+                job_id                = job_id,
+                prompt_index          = prompt_index,
+                clip_label            = clip_label,
+                use_audio             = use_audio,
+                reference_image_path  = img_path,
             )
             if result["status"] == "completed":
+                if is_text_only_retry:
+                    logger.info(f"   ✅ [{label}] Succeeded as text-only after img2vid block")
+                result["api_calls_made"]  = _api_calls_made
+                result["rate_limit_hits"] = _rate_limit_hits
                 return result
 
+            error_type = result.get("error_type", "")
+            error_msg  = result.get("error_message", "")
             logger.warning(
                 f"   ⚠️  [{label}] model {model} failed — "
-                f"error_type={result.get('error_type')} | "
-                f"msg={result.get('error_message', '')[:80]}"
+                f"error_type={error_type} | "
+                f"msg={error_msg[:80]}"
             )
-            if label == "PRIMARY":
+
+            # Rate limit (429): wait 60s then retry the SAME attempt once.
+            # Do NOT advance to text-only fallbacks — text-only won't fix a rate limit.
+            if error_type == "VEO_SUBMIT_ERR" and "429" in error_msg:
+                _rate_limit_hits += 1
+                if label in ("PRIMARY", "PRIMARY-TEXT"):
+                    logger.warning("   ⏳ [RATE_LIMIT] 429 received — waiting 60s before retrying FALLBACK...")
+                    await asyncio.sleep(60)
+                    logger.info("   🔄 Retrying with FALLBACK model after backoff...")
+                    continue   # advance to FALLBACK (or FALLBACK-TEXT)
+                else:
+                    # FALLBACK also rate-limited — nothing more to try right now
+                    logger.error("   ❌ [RATE_LIMIT] Both models rate-limited — aborting this clip")
+                    break
+
+            # VEO_NO_VIDEO on img2vid — degrade to text-only
+            if has_image and not is_text_only_retry:
+                if error_type != "VEO_NO_VIDEO":
+                    # Non-img2vid, non-rate-limit error (e.g. VEO_SUBMIT_ERR without 429)
+                    # FALLBACK model is tried for PRIMARY failures, then we stop.
+                    if label == "PRIMARY":
+                        logger.info("   🔄 Retrying with FALLBACK model...")
+                        continue
+                    else:
+                        break   # FALLBACK also failed — stop, text-only won't help
+                if label == "PRIMARY":
+                    logger.info("   🔄 Retrying with FALLBACK model (VEO_NO_VIDEO)...")
+            elif label in ("PRIMARY", "PRIMARY-TEXT"):
                 logger.info("   🔄 Retrying with FALLBACK model...")
 
-        # Both models failed — return the last failure result
+        # All attempts failed — return the last failure result
         result["error_message"] = (
             f"Both primary ({self.model_primary}) and fallback "
             f"({self.model_fallback}) models failed. "
             f"Last error: {result.get('error_message', 'unknown')}"
         )
+        result["api_calls_made"]  = _api_calls_made
+        result["rate_limit_hits"] = _rate_limit_hits
         return result
 
     # ── Internal: single model attempt ────────────────────────────────────────
@@ -227,32 +296,58 @@ class VeoGenerator:
         prompt_index: int,
         clip_label: Optional[str],
         use_audio: bool,
+        reference_image_path: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """Submit, poll, and download for one specific model."""
 
         start_time = time.time()
         logger.info(f"   🚀 [{model_label}] Submitting to model: {model}")
 
-        # ── Step 1: Submit ────────────────────────────────────────────────────
+        # ── Step 1: Build image anchor (img2vid chaining) ─────────────────────
+        ref_image_obj = None
+        if reference_image_path and reference_image_path.exists():
+            try:
+                img_bytes     = reference_image_path.read_bytes()
+                suffix        = reference_image_path.suffix.lower()
+                mime          = "image/png" if suffix == ".png" else "image/jpeg"
+                ref_image_obj = genai.types.Image(image_bytes=img_bytes, mime_type=mime)
+                logger.info(
+                    f"   🖼️  [{model_label}] Loaded reference image: "
+                    f"{reference_image_path.name} ({len(img_bytes) / 1024:.1f} KB)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"   ⚠️  [{model_label}] Could not load reference image "
+                    f"{reference_image_path}: {e} — falling back to text-only"
+                )
+                ref_image_obj = None
+
+        # ── Step 2: Submit ────────────────────────────────────────────────────
+        # No pre-submission delay needed at concurrency=1.
+        # Sequential clips within a prompt take 70-100s each — naturally
+        # under 2 RPM without any artificial wait.
+        # 429 backoff (60s) in the attempt loop handles bursts if they occur.
         try:
-            operation = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self._client.models.generate_videos(
+            def _submit() -> Any:
+                kwargs: Dict[str, Any] = dict(
                     model  = model,
                     prompt = prompt,
                     config = GenerateVideosConfig(
-                        # FIX: generate_audio removed — not a valid Gemini API field.
-                        # Veo 3.1 generates audio natively; the flag was causing
-                        # "Invalid request parameter" rejections at the API level
-                        # before the model ran (execution_time = 0.0s).
-                        aspect_ratio      = self.aspect_ratio,
-                        resolution        = self.resolution,
-                        duration_seconds  = self.clip_duration,
-                        number_of_videos  = self.sample_count,
-                        # person_generation = self.person_generation,
+                        aspect_ratio     = self.aspect_ratio,
+                        resolution       = self.resolution,
+                        duration_seconds = self.clip_duration,
+                        number_of_videos = self.sample_count,
+                        # person_generation intentionally omitted — any value
+                        # ("dont_allow" or "allow_adult") causes API errors or
+                        # silent VEO_NO_VIDEO failures. Omitting lets Veo use
+                        # its own default safely for both text and img2vid calls.
                     ),
-                ),
-            )
+                )
+                if ref_image_obj is not None:
+                    kwargs["image"] = ref_image_obj
+                return self._client.models.generate_videos(**kwargs)
+
+            operation = await asyncio.get_event_loop().run_in_executor(None, _submit)
         except Exception as e:
             err = str(e)
             logger.error(f"   ❌ [VEO_SUBMIT_ERR] Submit failed: {err}")
