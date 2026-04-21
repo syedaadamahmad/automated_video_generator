@@ -12,3 +12,8 @@ outputs/
 temp_processing/
 test_prompt_decomposer.py
 test_veo_pipeline.py
+test_stitching_pipeline.py
+test_veo_platform.py
+veo_cost_tracker.py
+veo_excel_processor.py
+veo_path_check.py
