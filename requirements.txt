@@ -39,3 +39,5 @@ python-multipart
 # for youtube publishing
 google-auth-oauthlib
 google-api-python-client
+
+bcrypt

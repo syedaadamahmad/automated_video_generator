@@ -1,0 +1,171 @@
+/* src/app/globals.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Apple system font ────────────────────────────────────────────────────── */
+@layer base {
+  html {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+                 "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+/* ── Design tokens ────────────────────────────────────────────────────────── */
+:root {
+  --bg:        #F5F5F7;
+  --surface:   #FFFFFF;
+  --surface2:  #F5F5F7;
+  --border:    #D2D2D7;
+  --border2:   #E8E8ED;
+  --text:      #1D1D1F;
+  --text2:     #6E6E73;
+  --text3:     #86868B;
+  --accent:    #0071E3;
+  --success:   #34C759;
+  --warn:      #FF9F0A;
+  --error:     #FF3B30;
+  --skel:      #E5E5EA;
+  --skel2:     #F0F0F5;
+  --radius:    12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --pill:      980px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:        #000000;
+    --surface:   #1C1C1E;
+    --surface2:  #2C2C2E;
+    --border:    #3A3A3C;
+    --border2:   #2C2C2E;
+    --text:      #F5F5F7;
+    --text2:     rgba(235,235,245,0.80);
+    --text3:     rgba(235,235,245,0.60);
+    --accent:    #0A84FF;
+    --success:   #30D158;
+    --warn:      #FF9F0A;
+    --error:     #FF453A;
+    --skel:      #3A3A3C;
+    --skel2:     #48484A;
+  }
+}
+
+/* ── Base ────────────────────────────────────────────────────────────────── */
+body {
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100dvh;
+}
+
+/* ── Scrollbar (thin, macOS-like) ─────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text3); }
+
+/* ── Skeleton shimmer ─────────────────────────────────────────────────────── */
+@keyframes shimmer {
+  0%   { background-position: -600px 0; }
+  100% { background-position: 600px 0; }
+}
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--skel) 25%,
+    var(--skel2) 50%,
+    var(--skel) 75%
+  );
+  background-size: 600px 100%;
+  animation: shimmer 1.4s infinite linear;
+  border-radius: 6px;
+}
+
+/* ── Status pills ─────────────────────────────────────────────────────────── */
+.pill-done    { background: rgba(52,199,89,.15);  color: #34C759; }
+.pill-partial { background: rgba(255,159,10,.15); color: #FF9F0A; }
+.pill-run     { background: rgba(0,113,227,.15);  color: #0071E3; }
+.pill-fail    { background: rgba(255,59,48,.15);  color: #FF3B30; }
+.pill-pending { background: rgba(142,142,147,.15);color: #8E8E93; }
+
+/* ── Tooltip ──────────────────────────────────────────────────────────────── */
+.tooltip-wrap { position: relative; display: inline-flex; align-items: center; }
+.tooltip-wrap .tooltip-box {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--text);
+  color: var(--bg);
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 6px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+  max-width: 260px;
+  white-space: normal;
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .15s;
+  z-index: 50;
+  box-shadow: 0 4px 16px rgba(0,0,0,.15);
+}
+.tooltip-wrap:hover .tooltip-box { opacity: 1; }
+
+/* ── Table ────────────────────────────────────────────────────────────────── */
+.veo-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.veo-table th {
+  text-align: left;
+  padding: 8px 16px;
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text2);
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border2);
+}
+.veo-table td {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border2);
+  color: var(--text);
+  vertical-align: top;
+}
+.veo-table tr:last-child td { border-bottom: none; }
+.veo-table tr:hover td { background: var(--surface2); }
+
+/* ── Upload zone ──────────────────────────────────────────────────────────── */
+.upload-zone {
+  border: 1.5px dashed var(--border);
+  border-radius: var(--radius-lg);
+  padding: 3rem 2rem;
+  text-align: center;
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color .2s, background .2s;
+}
+.upload-zone:hover,
+.upload-zone.drag-over {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+/* ── Video card ───────────────────────────────────────────────────────────── */
+.video-card {
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  transition: box-shadow .2s;
+}
+.video-card:hover { box-shadow: 0 4px 24px rgba(0,0,0,.07); }
+
+/* ── Alert ────────────────────────────────────────────────────────────────── */
+.alert { display: flex; gap: 8px; align-items: flex-start;
+  padding: 10px 14px; border-radius: 10px; font-size: 13.5px; line-height: 1.4; }
+.alert-error { background: rgba(255,59,48,.08); border: 1px solid rgba(255,59,48,.2); color: var(--text); }
+.alert-warn  { background: rgba(255,159,10,.08);border: 1px solid rgba(255,159,10,.2);color: var(--text); }
+.alert-info  { background: rgba(0,113,227,.08); border: 1px solid rgba(0,113,227,.2); color: var(--text); }

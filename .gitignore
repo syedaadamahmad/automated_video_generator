@@ -8,6 +8,7 @@ generated_videos/
 # Ignore log files
 *.log
 outputs/
+node_modules/
 *.temp/
 temp_processing/
 test_prompt_decomposer.py
