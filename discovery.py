@@ -2,7 +2,7 @@ import os
 from google import genai
 
 # Setup Client - ensure your API key is correct
-client = genai.Client(api_key='AIzaSyC127F9jBdmS6zLj8I9X6DnZ4W8Dxib5nY', http_options={'api_version': 'v1beta'})
+client = genai.Client(api_key='', http_options={'api_version': 'v1beta'})
 
 def check_available_models():
     print("--- Scanning for Video/Veo Models ---")
